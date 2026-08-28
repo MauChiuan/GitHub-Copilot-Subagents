@@ -349,14 +349,32 @@ jobs:
               (Test-Path -LiteralPath $expandedVariableHome)) {
             throw 'install.cmd expanded an escaped literal %USERNAME% in the Copilot home.'
           }
-          $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          $negativeStdout = Join-Path $env:RUNNER_TEMP 'launcher-negative.stdout.txt'
+          $negativeStderr = Join-Path $env:RUNNER_TEMP 'launcher-negative.stderr.txt'
+          $previousTestLauncher = $env:LUNA_TEST_LAUNCHER
           try {
-            $PSNativeCommandUseErrorActionPreference = $false
-            $missingValueOutput = @(& $launcher -CopilotHome -WhatIf -WhatIf 2>&1)
-            $missingValueExitCode = $LASTEXITCODE
+            $env:LUNA_TEST_LAUNCHER = $launcher
+            $missingValueProcess = Start-Process `
+              -FilePath $env:ComSpec `
+              -ArgumentList '/d /s /c ""%LUNA_TEST_LAUNCHER%" -CopilotHome -WhatIf -WhatIf"' `
+              -RedirectStandardOutput $negativeStdout `
+              -RedirectStandardError $negativeStderr `
+              -Wait `
+              -PassThru `
+              -NoNewWindow
+            $missingValueExitCode = $missingValueProcess.ExitCode
+            $missingValueOutput = @(
+              if (Test-Path -LiteralPath $negativeStdout) {
+                Get-Content -LiteralPath $negativeStdout
+              }
+              if (Test-Path -LiteralPath $negativeStderr) {
+                Get-Content -LiteralPath $negativeStderr
+              }
+            )
           }
           finally {
-            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+            $env:LUNA_TEST_LAUNCHER = $previousTestLauncher
+            Remove-Item -LiteralPath $negativeStdout, $negativeStderr -Force -ErrorAction SilentlyContinue
           }
           if ($missingValueExitCode -eq 0 -or
               ($missingValueOutput -join "`n") -notmatch 'LUNA_ARGUMENT_ERROR: missing value for -CopilotHome') {
