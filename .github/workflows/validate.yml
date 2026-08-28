@@ -349,8 +349,15 @@ jobs:
               (Test-Path -LiteralPath $expandedVariableHome)) {
             throw 'install.cmd expanded an escaped literal %USERNAME% in the Copilot home.'
           }
-          $missingValueOutput = @(& $launcher -CopilotHome -WhatIf -WhatIf 2>&1)
-          $missingValueExitCode = $LASTEXITCODE
+          $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $missingValueOutput = @(& $launcher -CopilotHome -WhatIf -WhatIf 2>&1)
+            $missingValueExitCode = $LASTEXITCODE
+          }
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+          }
           if ($missingValueExitCode -eq 0 -or
               ($missingValueOutput -join "`n") -notmatch 'LUNA_ARGUMENT_ERROR: missing value for -CopilotHome') {
             throw "install.cmd did not reject an option-like -CopilotHome value. Output: $($missingValueOutput -join ' | ')"
