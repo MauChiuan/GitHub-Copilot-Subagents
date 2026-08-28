@@ -75,6 +75,16 @@ jobs:
             throw 'An explicitly empty Copilot home fell back to COPILOT_HOME.'
           }
 
+          $sourceSkillRoot = Split-Path -Path (Split-Path -Path $installer -Parent) -Parent
+          $overlapHome = Join-Path $sourceSkillRoot 'overlap-home'
+          Assert-Throws `
+            -Action { & $installer -CopilotHome $overlapHome -WhatIf } `
+            -ExpectedPattern 'source and target skill paths must not overlap' `
+            -FailureMessage 'Install unexpectedly accepted a target nested inside the source package.'
+          if (Test-Path -LiteralPath $overlapHome) {
+            throw 'A rejected overlapping target modified the source package.'
+          }
+
           $installOutput = @(& $installer -CopilotHome $copilotHome)
           if ($installOutput -notcontains 'LUNA_SUBAGENTS_INSTALL_OK') {
             throw 'Installation did not report success.'
@@ -235,4 +245,281 @@ jobs:
           $finalVerifyOutput = @(& $installer -Action Verify -CopilotHome $copilotHome)
           if ($finalVerifyOutput -notcontains 'LUNA_SUBAGENTS_VERIFY_OK') {
             throw 'Final verification did not report success.'
+          }
+
+      - name: Install and verify through install.cmd with PowerShell 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-LauncherResult {
+            param(
+              [Parameter(Mandatory)]
+              [object[]]$Output,
+
+              [Parameter(Mandatory)]
+              [int]$ExitCode,
+
+              [Parameter(Mandatory)]
+              [string]$ExpectedHostMarker,
+
+              [Parameter(Mandatory)]
+              [string]$ExpectedEdition,
+
+              [Parameter(Mandatory)]
+              [int]$ExpectedMajor,
+
+              [Parameter(Mandatory)]
+              [string]$Operation
+            )
+
+            if ($ExitCode -ne 0) {
+              throw "$Operation through install.cmd failed with exit code $ExitCode. Output: $($Output -join ' | ')"
+            }
+            if ($Output -notcontains $ExpectedHostMarker) {
+              throw "$Operation did not report $ExpectedHostMarker. Output: $($Output -join ' | ')"
+            }
+            $editionMarker = "LUNA_POWERSHELL_EDITION=$ExpectedEdition"
+            if ($Output -notcontains $editionMarker) {
+              throw "$Operation did not report $editionMarker. Output: $($Output -join ' | ')"
+            }
+            $versionLines = @($Output | Where-Object { "$_" -like 'LUNA_POWERSHELL_VERSION=*' })
+            if ($versionLines.Count -ne 1) {
+              throw "$Operation did not report exactly one PowerShell version. Output: $($Output -join ' | ')"
+            }
+            $reportedVersion = [version]("$($versionLines[0])".Substring('LUNA_POWERSHELL_VERSION='.Length))
+            if ($reportedVersion.Major -ne $ExpectedMajor) {
+              throw "$Operation ran with PowerShell $reportedVersion instead of major $ExpectedMajor."
+            }
+            $expectedMarker = if ($Operation -eq 'Install') {
+              'LUNA_SUBAGENTS_INSTALL_OK'
+            }
+            else {
+              'LUNA_SUBAGENTS_VERIFY_OK'
+            }
+            if ($Output -notcontains $expectedMarker) {
+              throw "$Operation did not report $expectedMarker. Output: $($Output -join ' | ')"
+            }
+          }
+
+          $launcher = Join-Path $PWD 'Skills\luna-subagents\scripts\install.cmd'
+          $copilotHomeBase = Join-Path $env:RUNNER_TEMP 'launcher-100%!& (normal home)'
+          $launcherHomeArgument = $copilotHomeBase + '\'
+
+          $installOutput = @(& $launcher -CopilotHome $launcherHomeArgument)
+          $installExitCode = $LASTEXITCODE
+          Assert-LauncherResult `
+            -Output $installOutput `
+            -ExitCode $installExitCode `
+            -ExpectedHostMarker 'LUNA_POWERSHELL_HOST=pwsh' `
+            -ExpectedEdition 'Core' `
+            -ExpectedMajor 7 `
+            -Operation 'Install'
+
+          $verifyOutput = @(& $launcher -Action Verify -CopilotHome $launcherHomeArgument)
+          $verifyExitCode = $LASTEXITCODE
+          Assert-LauncherResult `
+            -Output $verifyOutput `
+            -ExitCode $verifyExitCode `
+            -ExpectedHostMarker 'LUNA_POWERSHELL_HOST=pwsh' `
+            -ExpectedEdition 'Core' `
+            -ExpectedMajor 7 `
+            -Operation 'Verify'
+
+          if (-not (Test-Path -LiteralPath $copilotHomeBase -PathType Container)) {
+            throw 'install.cmd corrupted a Copilot home containing special characters or a trailing backslash.'
+          }
+
+          $literalVariableHome = Join-Path $env:RUNNER_TEMP 'launcher-%USERNAME%-literal'
+          $literalVariableArgument = (Join-Path $env:RUNNER_TEMP 'launcher-^%USERNAME^%-literal') + '\'
+          $literalVariableOutput = @(& $launcher -CopilotHome $literalVariableArgument)
+          $literalVariableExitCode = $LASTEXITCODE
+          Assert-LauncherResult `
+            -Output $literalVariableOutput `
+            -ExitCode $literalVariableExitCode `
+            -ExpectedHostMarker 'LUNA_POWERSHELL_HOST=pwsh' `
+            -ExpectedEdition 'Core' `
+            -ExpectedMajor 7 `
+            -Operation 'Install'
+          if (-not (Test-Path -LiteralPath $literalVariableHome -PathType Container)) {
+            throw 'install.cmd re-expanded an escaped literal %USERNAME% in the Copilot home.'
+          }
+          $expandedVariableHome = $literalVariableHome.Replace('%USERNAME%', $env:USERNAME)
+          if ($expandedVariableHome -cne $literalVariableHome -and
+              (Test-Path -LiteralPath $expandedVariableHome)) {
+            throw 'install.cmd expanded an escaped literal %USERNAME% in the Copilot home.'
+          }
+          $missingValueOutput = @(& $launcher -CopilotHome -WhatIf -WhatIf 2>&1)
+          $missingValueExitCode = $LASTEXITCODE
+          if ($missingValueExitCode -eq 0 -or
+              ($missingValueOutput -join "`n") -notmatch 'LUNA_ARGUMENT_ERROR: missing value for -CopilotHome') {
+            throw "install.cmd did not reject an option-like -CopilotHome value. Output: $($missingValueOutput -join ' | ')"
+          }
+
+      - name: Install and verify through install.cmd fallback to Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-LauncherResult {
+            param(
+              [Parameter(Mandatory)]
+              [object[]]$Output,
+
+              [Parameter(Mandatory)]
+              [int]$ExitCode,
+
+              [Parameter(Mandatory)]
+              [string]$ExpectedHostMarker,
+
+              [Parameter(Mandatory)]
+              [string]$ExpectedEdition,
+
+              [Parameter(Mandatory)]
+              [int]$ExpectedMajor,
+
+              [Parameter(Mandatory)]
+              [string]$Operation
+            )
+
+            if ($ExitCode -ne 0) {
+              throw "$Operation through install.cmd failed with exit code $ExitCode. Output: $($Output -join ' | ')"
+            }
+            if ($Output -notcontains $ExpectedHostMarker) {
+              throw "$Operation did not report $ExpectedHostMarker. Output: $($Output -join ' | ')"
+            }
+            $editionMarker = "LUNA_POWERSHELL_EDITION=$ExpectedEdition"
+            if ($Output -notcontains $editionMarker) {
+              throw "$Operation did not report $editionMarker. Output: $($Output -join ' | ')"
+            }
+            $versionLines = @($Output | Where-Object { "$_" -like 'LUNA_POWERSHELL_VERSION=*' })
+            if ($versionLines.Count -ne 1) {
+              throw "$Operation did not report exactly one PowerShell version. Output: $($Output -join ' | ')"
+            }
+            $reportedVersion = [version]("$($versionLines[0])".Substring('LUNA_POWERSHELL_VERSION='.Length))
+            if ($reportedVersion.Major -ne $ExpectedMajor) {
+              throw "$Operation ran with PowerShell $reportedVersion instead of major $ExpectedMajor."
+            }
+            $expectedMarker = if ($Operation -eq 'Install') {
+              'LUNA_SUBAGENTS_INSTALL_OK'
+            }
+            else {
+              'LUNA_SUBAGENTS_VERIFY_OK'
+            }
+            if ($Output -notcontains $expectedMarker) {
+              throw "$Operation did not report $expectedMarker. Output: $($Output -join ' | ')"
+            }
+          }
+
+          $launcher = Join-Path $PWD 'Skills\luna-subagents\scripts\install.cmd'
+          $copilotHomeBase = Join-Path $env:RUNNER_TEMP 'fallback-100%!& (home)'
+          $launcherHomeArgument = $copilotHomeBase + '\'
+          $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $windowsPowerShellDirectory = Split-Path -Path $windowsPowerShell -Parent
+          if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+            throw "Windows PowerShell 5.1 was not found at $windowsPowerShell."
+          }
+
+          $oldPwshDirectory = Join-Path $env:RUNNER_TEMP 'old-pwsh'
+          New-Item -ItemType Directory -Path $oldPwshDirectory -Force | Out-Null
+          $oldPwsh = Join-Path $oldPwshDirectory 'pwsh.exe'
+          Copy-Item -LiteralPath $windowsPowerShell -Destination $oldPwsh
+
+          $originalPath = $env:Path
+          $originalPSModulePath = $env:PSModulePath
+          try {
+            $env:Path = @(
+              $oldPwshDirectory,
+              (Join-Path $env:SystemRoot 'System32'),
+              $windowsPowerShellDirectory
+            ) -join [IO.Path]::PathSeparator
+            $env:PSModulePath = Join-Path $env:RUNNER_TEMP 'missing-modules'
+
+            $whereOutput = @(where.exe where.exe 2>$null)
+            $whereExitCode = $LASTEXITCODE
+            if ($whereExitCode -ne 0 -or $whereOutput.Count -eq 0) {
+              throw 'Fallback test removed where.exe from PATH.'
+            }
+            $pwshOutput = @(where.exe pwsh.exe 2>$null)
+            $pwshExitCode = $LASTEXITCODE
+            if ($pwshExitCode -ne 0 -or $pwshOutput.Count -ne 1 -or
+                -not [string]::Equals($pwshOutput[0], $oldPwsh, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Fallback test did not find only the old pwsh shim: $($pwshOutput -join ' | ')"
+            }
+            $oldPwshMajor = & $oldPwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.Major'
+            if ($LASTEXITCODE -ne 0 -or [int]$oldPwshMajor -ge 7) {
+              throw "Fallback test requires a runnable pwsh.exe shim below major 7, received: $oldPwshMajor"
+            }
+            $windowsPowerShellOutput = @(where.exe powershell.exe 2>$null)
+            $windowsPowerShellExitCode = $LASTEXITCODE
+            if ($windowsPowerShellExitCode -ne 0 -or $windowsPowerShellOutput.Count -eq 0) {
+              throw 'Fallback test removed Windows PowerShell from PATH.'
+            }
+
+            $installOutput = @(& $launcher -CopilotHome $launcherHomeArgument)
+            $installExitCode = $LASTEXITCODE
+            Assert-LauncherResult `
+              -Output $installOutput `
+              -ExitCode $installExitCode `
+              -ExpectedHostMarker 'LUNA_POWERSHELL_HOST=windows-powershell' `
+              -ExpectedEdition 'Desktop' `
+              -ExpectedMajor 5 `
+              -Operation 'Install'
+
+            $verifyOutput = @(& $launcher -Action Verify -CopilotHome $launcherHomeArgument)
+            $verifyExitCode = $LASTEXITCODE
+            Assert-LauncherResult `
+              -Output $verifyOutput `
+              -ExitCode $verifyExitCode `
+              -ExpectedHostMarker 'LUNA_POWERSHELL_HOST=windows-powershell' `
+              -ExpectedEdition 'Desktop' `
+              -ExpectedMajor 5 `
+              -Operation 'Verify'
+
+            if (-not (Test-Path -LiteralPath $copilotHomeBase -PathType Container)) {
+              throw 'Fallback install.cmd corrupted a Copilot home containing special characters or a trailing backslash.'
+            }
+          }
+          finally {
+            $env:Path = $originalPath
+            $env:PSModulePath = $originalPSModulePath
+          }
+
+      - name: Install and verify install.ps1 with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $version = $PSVersionTable.PSVersion
+          if ($version.Major -ne 5 -or $version.Minor -lt 1) {
+            throw "Expected Windows PowerShell major 5 and minor at least 1, received $($version.ToString())."
+          }
+
+          $installer = Join-Path $PWD 'Skills\luna-subagents\scripts\install.ps1'
+          $copilotHome = Join-Path $env:RUNNER_TEMP 'direct Windows PowerShell home'
+
+          $originalPSModulePath = $env:PSModulePath
+          $env:PSModulePath = Join-Path $env:RUNNER_TEMP 'missing-direct-modules'
+          try {
+            $installOutput = @(& $installer -CopilotHome $copilotHome)
+            $verifyOutput = @(& $installer -Action Verify -CopilotHome $copilotHome)
+          }
+          finally {
+            $env:PSModulePath = $originalPSModulePath
+          }
+
+          if ($installOutput -notcontains 'LUNA_SUBAGENTS_INSTALL_OK') {
+            throw "Direct Windows PowerShell install did not report success. Output: $($installOutput -join ' | ')"
+          }
+          if ($installOutput -notcontains 'LUNA_POWERSHELL_EDITION=Desktop' -or
+              $installOutput -notcontains "LUNA_POWERSHELL_VERSION=$($version.ToString())") {
+            throw "Direct Windows PowerShell install did not report the actual runtime. Output: $($installOutput -join ' | ')"
+          }
+
+          if ($verifyOutput -notcontains 'LUNA_SUBAGENTS_VERIFY_OK') {
+            throw "Direct Windows PowerShell verify did not report success. Output: $($verifyOutput -join ' | ')"
+          }
+          if ($verifyOutput -notcontains 'LUNA_POWERSHELL_EDITION=Desktop' -or
+              $verifyOutput -notcontains "LUNA_POWERSHELL_VERSION=$($version.ToString())") {
+            throw "Direct Windows PowerShell verify did not report the actual runtime. Output: $($verifyOutput -join ' | ')"
           }

@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -13,7 +13,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (-not [OperatingSystem]::IsWindows()) {
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'PLATFORM_UNSUPPORTED: luna-subagents installation is supported only on Windows.'
 }
 
@@ -21,12 +21,14 @@ $skillName = 'luna-subagents'
 $agentFileName = 'luna-subagents-executor.agent.md'
 $beginMarker = '<!-- BEGIN luna-subagents managed section -->'
 $endMarker = '<!-- END luna-subagents managed section -->'
-$managedHeading = '## Luna subagent 委派'
+$managedHeadingText = ([char]0x59D4).ToString() + ([char]0x6D3E).ToString()
+$managedHeading = '## Luna subagent ' + $managedHeadingText
 $canonicalRelativePaths = @(
     'SKILL.md',
     'assets/global-copilot-instructions-section.md',
     'assets/agents/luna-subagents-executor.agent.md',
-    'scripts/install.ps1'
+    'scripts/install.ps1',
+    'scripts/install.cmd'
 )
 $legacyPackageRelativePaths = @(
     'scripts/resolve-quota-tier.ps1',
@@ -71,6 +73,46 @@ function Join-PortablePath {
     return $result
 }
 
+function Get-RelativeChildPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $normalizedRoot = Get-NormalizedPath -Path $Root
+    $normalizedPath = Get-NormalizedPath -Path $Path
+    if ([string]::Equals(
+        $normalizedRoot,
+        $normalizedPath,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return ''
+    }
+
+    $directorySeparator = [string][IO.Path]::DirectorySeparatorChar
+    $altDirectorySeparator = [string][IO.Path]::AltDirectorySeparatorChar
+    $rootPrefix = $normalizedRoot
+    if (-not $rootPrefix.EndsWith($directorySeparator, [StringComparison]::Ordinal) -and
+        -not $rootPrefix.EndsWith($altDirectorySeparator, [StringComparison]::Ordinal)) {
+        $rootPrefix += $directorySeparator
+    }
+
+    if (-not $normalizedPath.StartsWith(
+        $rootPrefix,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw ('RELATIVE_PATH_OUTSIDE_ROOT: path is not root or a child of root: {0} (root: {1})' -f
+            $normalizedPath,
+            $normalizedRoot)
+    }
+
+    $relativePath = $normalizedPath.Substring($rootPrefix.Length)
+    if ([string]::IsNullOrEmpty($relativePath)) {
+        return ''
+    }
+    return $relativePath.Replace($directorySeparator, '/').Replace($altDirectorySeparator, '/')
+}
+
 function Test-SamePath {
     param(
         [Parameter(Mandatory = $true)][string]$First,
@@ -80,6 +122,34 @@ function Test-SamePath {
     return [string]::Equals(
         (Get-NormalizedPath -Path $First),
         (Get-NormalizedPath -Path $Second),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Test-StrictChildPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Parent,
+        [Parameter(Mandatory = $true)][string]$Child
+    )
+
+    $normalizedParent = Get-NormalizedPath -Path $Parent
+    $normalizedChild = Get-NormalizedPath -Path $Child
+    if ([string]::Equals(
+        $normalizedParent,
+        $normalizedChild,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $false
+    }
+
+    $separator = [string][IO.Path]::DirectorySeparatorChar
+    $parentPrefix = $normalizedParent
+    if (-not $parentPrefix.EndsWith($separator, [StringComparison]::Ordinal)) {
+        $parentPrefix += $separator
+    }
+
+    return $normalizedChild.StartsWith(
+        $parentPrefix,
         [StringComparison]::OrdinalIgnoreCase
     )
 }
@@ -117,6 +187,31 @@ function Test-ByteOrderMark {
         return $true
     }
     return $false
+}
+
+function Get-Sha256FileHash {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $algorithm = $null
+    $stream = $null
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $stream = [IO.File]::OpenRead($Path)
+        $hashBytes = $algorithm.ComputeHash($stream)
+        return ([BitConverter]::ToString($hashBytes)).Replace('-', '')
+    }
+    finally {
+        try {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+        finally {
+            if ($null -ne $algorithm) {
+                $algorithm.Dispose()
+            }
+        }
+    }
 }
 
 function Test-ReparsePoint {
@@ -251,7 +346,7 @@ function Get-CanonicalManagedBlock {
     ))
     $headingMatches = @([regex]::Matches(
         $normalized,
-        '(?m)^##(?!#)[ \t]+Luna subagent 委派[ \t]*$'
+        '(?m)^##(?!#)[ \t]+Luna subagent ' + [regex]::Escape($managedHeadingText) + '[ \t]*$'
     ))
 
     if ($beginTokenCount -ne 1 -or
@@ -391,7 +486,7 @@ function Get-InstructionPlan {
     ))
     $headingMatches = @([regex]::Matches(
         $existingText,
-        '(?m)^##(?!#)[ \t]+Luna subagent 委派[ \t]*(?=\r?$)'
+        '(?m)^##(?!#)[ \t]+Luna subagent ' + [regex]::Escape($managedHeadingText) + '[ \t]*(?=\r?$)'
     ))
 
     if ($beginTokenCount -ne $endTokenCount -or
@@ -474,12 +569,12 @@ function Copy-PackageTree {
     $pathComparer = [StringComparer]::OrdinalIgnoreCase
     $sourceRelativePaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
     foreach ($sourceFile in Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force) {
-        $relativePath = [IO.Path]::GetRelativePath($sourcePath, $sourceFile.FullName)
+        $relativePath = Get-RelativeChildPath -Root $sourcePath -Path $sourceFile.FullName
         [void]$sourceRelativePaths.Add($relativePath)
     }
 
     foreach ($destinationFile in Get-ChildItem -LiteralPath $destinationPath -Recurse -File -Force) {
-        $relativePath = [IO.Path]::GetRelativePath($destinationPath, $destinationFile.FullName)
+        $relativePath = Get-RelativeChildPath -Root $destinationPath -Path $destinationFile.FullName
         if (-not $sourceRelativePaths.Contains($relativePath)) {
             Remove-Item -LiteralPath $destinationFile.FullName -Force
         }
@@ -495,7 +590,7 @@ function Copy-PackageTree {
     }
 
     foreach ($sourceFile in Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force) {
-        $relativePath = [IO.Path]::GetRelativePath($sourcePath, $sourceFile.FullName)
+        $relativePath = Get-RelativeChildPath -Root $sourcePath -Path $sourceFile.FullName
         $destinationFile = Join-Path $destinationPath $relativePath
         $destinationDirectory = Split-Path $destinationFile -Parent
         New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
@@ -545,12 +640,12 @@ function Assert-Installed {
 
     $sourceManifest = @(
         Get-ChildItem -LiteralPath $SourceSkillRoot -Recurse -File -Force |
-            ForEach-Object { [IO.Path]::GetRelativePath($SourceSkillRoot, $_.FullName).Replace('\', '/') } |
+            ForEach-Object { Get-RelativeChildPath -Root $SourceSkillRoot -Path $_.FullName } |
             Sort-Object
     )
     $targetManifest = @(
         Get-ChildItem -LiteralPath $targetSkillRoot -Recurse -File -Force |
-            ForEach-Object { [IO.Path]::GetRelativePath($targetSkillRoot, $_.FullName).Replace('\', '/') } |
+            ForEach-Object { Get-RelativeChildPath -Root $targetSkillRoot -Path $_.FullName } |
             Sort-Object
     )
     $manifestDifference = @(Compare-Object -ReferenceObject $sourceManifest -DifferenceObject $targetManifest)
@@ -563,8 +658,8 @@ function Assert-Installed {
     foreach ($relativePath in $sourceManifest) {
         $sourcePath = Join-PortablePath -Root $SourceSkillRoot -RelativePath $relativePath
         $targetPath = Join-PortablePath -Root $targetSkillRoot -RelativePath $relativePath
-        $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-        $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash
+        $sourceHash = Get-Sha256FileHash -Path $sourcePath
+        $targetHash = Get-Sha256FileHash -Path $targetPath
         if ($sourceHash -cne $targetHash) {
             throw ('VERIFY_FAILED: installed package file is stale or tampered: ' + $relativePath)
         }
@@ -582,8 +677,8 @@ function Assert-Installed {
     if (-not (Test-Path -LiteralPath $targetAgentPath -PathType Leaf)) {
         throw ('VERIFY_FAILED: executor agent is missing: ' + $agentFileName)
     }
-    $sourceAgentHash = (Get-FileHash -LiteralPath $sourceAgentPath -Algorithm SHA256).Hash
-    $targetAgentHash = (Get-FileHash -LiteralPath $targetAgentPath -Algorithm SHA256).Hash
+    $sourceAgentHash = Get-Sha256FileHash -Path $sourceAgentPath
+    $targetAgentHash = Get-Sha256FileHash -Path $targetAgentPath
     if ($sourceAgentHash -cne $targetAgentHash) {
         throw ('VERIFY_FAILED: executor agent is stale or tampered: ' + $agentFileName)
     }
@@ -605,9 +700,16 @@ $targetHome = Resolve-CopilotHome -RequestedPath $CopilotHome
 Assert-Package -SkillRoot $sourceSkillRoot
 $targetErrorPrefix = if ($Action -eq 'Verify') { 'VERIFY_FAILED' } else { 'INSTALL_FAILED' }
 Assert-SafeManagedPaths -TargetHome $targetHome -ErrorPrefix $targetErrorPrefix
+$targetSkillRoot = Join-PortablePath -Root $targetHome -RelativePath 'skills/luna-subagents'
+if ((Test-StrictChildPath -Parent $sourceSkillRoot -Child $targetSkillRoot) -or
+    (Test-StrictChildPath -Parent $targetSkillRoot -Child $sourceSkillRoot)) {
+    throw "${targetErrorPrefix}: source and target skill paths must not overlap: $sourceSkillRoot and $targetSkillRoot"
+}
 
 if ($Action -eq 'Verify') {
     Assert-Installed -SourceSkillRoot $sourceSkillRoot -TargetHome $targetHome
+    Write-Output ('LUNA_POWERSHELL_VERSION=' + $PSVersionTable.PSVersion.ToString())
+    Write-Output ('LUNA_POWERSHELL_EDITION=' + $PSVersionTable.PSEdition)
     Write-Output 'LUNA_SUBAGENTS_VERIFY_OK'
     return
 }
@@ -616,7 +718,6 @@ if (Test-Path -LiteralPath $targetHome -PathType Leaf) {
     throw 'INSTALL_FAILED: Copilot home exists but is not a directory.'
 }
 
-$targetSkillRoot = Join-PortablePath -Root $targetHome -RelativePath 'skills/luna-subagents'
 $targetAgentRoot = Join-Path $targetHome 'agents'
 $targetAgentPath = Join-Path $targetAgentRoot $agentFileName
 $sourceAgentPath = Join-PortablePath -Root $sourceSkillRoot -RelativePath 'assets/agents/luna-subagents-executor.agent.md'
@@ -648,5 +749,7 @@ if ($instructionPlan.ShouldWrite) {
 }
 
 Assert-Installed -SourceSkillRoot $sourceSkillRoot -TargetHome $targetHome
+Write-Output ('LUNA_POWERSHELL_VERSION=' + $PSVersionTable.PSVersion.ToString())
+Write-Output ('LUNA_POWERSHELL_EDITION=' + $PSVersionTable.PSEdition)
 Write-Output 'LUNA_SUBAGENTS_INSTALL_OK'
 Write-Output 'RELOAD_REQUIRED: Run /skills reload, then restart Copilot CLI or start a new session.'
