@@ -1,0 +1,238 @@
+name: Validate luna-subagents
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and verify with PowerShell 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-Throws {
+            param(
+              [Parameter(Mandatory)]
+              [scriptblock]$Action,
+
+              [Parameter(Mandatory)]
+              [string]$ExpectedPattern,
+
+              [Parameter(Mandatory)]
+              [string]$FailureMessage
+            )
+
+            try {
+              & $Action
+              throw $FailureMessage
+            }
+            catch {
+              if ($_.Exception.Message -eq $FailureMessage) {
+                throw
+              }
+              if ($_.Exception.Message -notmatch $ExpectedPattern) {
+                throw "Unexpected error. Expected '$ExpectedPattern', received: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          $copilotHome = Join-Path $env:RUNNER_TEMP 'copilot-home'
+          New-Item -ItemType Directory -Path $copilotHome -Force | Out-Null
+          [IO.File]::WriteAllText(
+            (Join-Path $copilotHome 'copilot-instructions.md'),
+            "# Existing instructions`r`n`r`nKeep this line.`r`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+
+          $installer = Join-Path $PWD 'Skills\luna-subagents\scripts\install.ps1'
+          $sourceSkill = Join-Path $PWD 'Skills\luna-subagents\SKILL.md'
+          $installedSkillRoot = Join-Path $copilotHome 'skills\luna-subagents'
+          $installedSkill = Join-Path $installedSkillRoot 'SKILL.md'
+          $instructionsPath = Join-Path $copilotHome 'copilot-instructions.md'
+          $agentPath = Join-Path $copilotHome 'agents\luna-subagents-executor.agent.md'
+
+          $fallbackHome = Join-Path $env:RUNNER_TEMP 'fallback-home'
+          $previousCopilotHome = $env:COPILOT_HOME
+          $env:COPILOT_HOME = $fallbackHome
+          try {
+            Assert-Throws `
+              -Action { & $installer -CopilotHome '' -WhatIf } `
+              -ExpectedPattern 'must not be empty' `
+              -FailureMessage 'Install unexpectedly accepted an explicitly empty Copilot home.'
+          }
+          finally {
+            $env:COPILOT_HOME = $previousCopilotHome
+          }
+          if (Test-Path -LiteralPath $fallbackHome) {
+            throw 'An explicitly empty Copilot home fell back to COPILOT_HOME.'
+          }
+
+          $installOutput = @(& $installer -CopilotHome $copilotHome)
+          if ($installOutput -notcontains 'LUNA_SUBAGENTS_INSTALL_OK') {
+            throw 'Installation did not report success.'
+          }
+          $verifyOutput = @(& $installer -Action Verify -CopilotHome $copilotHome)
+          if ($verifyOutput -notcontains 'LUNA_SUBAGENTS_VERIFY_OK') {
+            throw 'Verification did not report success.'
+          }
+
+          $agent = [IO.File]::ReadAllText($agentPath).Replace("`r`n", "`n").Replace("`r", "`n")
+          $frontmatterMatch = [regex]::Match(
+            $agent,
+            '\A---\n(?<frontmatter>.*?)\n---(?:\n|\z)',
+            [Text.RegularExpressions.RegexOptions]::Singleline
+          )
+          if (-not $frontmatterMatch.Success) {
+            throw 'Installed executor does not begin with YAML frontmatter.'
+          }
+          $frontmatterLines = @($frontmatterMatch.Groups['frontmatter'].Value -split "`n")
+          $modelLines = @($frontmatterLines | Where-Object { $_ -match '^\s*model\s*:' })
+          $effortLines = @($frontmatterLines | Where-Object { $_ -match '^\s*reasoning-effort\s*:' })
+          if ($modelLines.Count -ne 1 -or $modelLines[0] -cne 'model: gpt-5.6-luna') {
+            throw 'Installed executor must contain exactly "model: gpt-5.6-luna".'
+          }
+          if ($effortLines.Count -ne 1 -or $effortLines[0] -cne 'reasoning-effort: max') {
+            throw 'Installed executor must contain exactly "reasoning-effort: max".'
+          }
+          if ($frontmatterLines -match '^\s*(service-tier|service_tier)\s*:') {
+            throw 'Installed executor must not configure quota-based service routing.'
+          }
+
+          $firstInstructionsHash = (Get-FileHash -LiteralPath $instructionsPath -Algorithm SHA256).Hash
+          $repeatOutput = @(& $installer -CopilotHome $copilotHome)
+          if ($repeatOutput -notcontains 'LUNA_SUBAGENTS_INSTALL_OK') {
+            throw 'Repeated installation did not report success.'
+          }
+          $secondInstructionsHash = (Get-FileHash -LiteralPath $instructionsPath -Algorithm SHA256).Hash
+          if ($firstInstructionsHash -cne $secondInstructionsHash) {
+            throw 'Repeated installation changed canonical instructions.'
+          }
+
+          $instructions = [IO.File]::ReadAllText($instructionsPath)
+          if (-not $instructions.Contains('Keep this line.')) {
+            throw 'Installation removed existing instructions.'
+          }
+          if (([regex]::Matches($instructions, '<!-- BEGIN luna-subagents managed section -->')).Count -ne 1 -or
+              ([regex]::Matches($instructions, '<!-- END luna-subagents managed section -->')).Count -ne 1) {
+            throw 'Repeated installation did not preserve exactly one managed section.'
+          }
+
+          $unexpected = Join-Path $installedSkillRoot 'unexpected.txt'
+          [IO.File]::WriteAllText($unexpected, 'unexpected', [Text.UTF8Encoding]::new($false))
+          Assert-Throws `
+            -Action { & $installer -Action Verify -CopilotHome $copilotHome } `
+            -ExpectedPattern 'unexpected installed file' `
+            -FailureMessage 'Verify unexpectedly accepted an extra package file.'
+          & $installer -CopilotHome $copilotHome | Out-Null
+          if (Test-Path -LiteralPath $unexpected) {
+            throw 'Reinstall did not remove an extra package file.'
+          }
+
+          Add-Content -LiteralPath $installedSkill -Value 'tampered'
+          Assert-Throws `
+            -Action { & $installer -Action Verify -CopilotHome $copilotHome } `
+            -ExpectedPattern 'stale or tampered' `
+            -FailureMessage 'Verify unexpectedly accepted a stale or tampered package file.'
+          & $installer -CopilotHome $copilotHome | Out-Null
+          $sourceSkillHash = (Get-FileHash -LiteralPath $sourceSkill -Algorithm SHA256).Hash
+          $installedSkillHash = (Get-FileHash -LiteralPath $installedSkill -Algorithm SHA256).Hash
+          if ($sourceSkillHash -cne $installedSkillHash) {
+            throw 'Reinstall did not restore a stale or tampered package file.'
+          }
+
+          $legacyProfiles = @(
+            'luna-subagents-executor.toml',
+            'luna-subagents-executor-fast.toml',
+            'luna-subagents-executor-standard.toml'
+          )
+          foreach ($legacyProfile in $legacyProfiles) {
+            [IO.File]::WriteAllText(
+              (Join-Path $copilotHome "agents\$legacyProfile"),
+              'legacy',
+              [Text.UTF8Encoding]::new($false)
+            )
+          }
+          & $installer -CopilotHome $copilotHome | Out-Null
+          foreach ($legacyProfile in $legacyProfiles) {
+            if (Test-Path -LiteralPath (Join-Path $copilotHome "agents\$legacyProfile")) {
+              throw "Reinstall did not remove obsolete executor profile: $legacyProfile"
+            }
+          }
+
+          $linkHome = Join-Path $env:RUNNER_TEMP 'copilot-link-home'
+          $externalSkills = Join-Path $env:RUNNER_TEMP 'external-skills'
+          New-Item -ItemType Directory -Path $linkHome, $externalSkills -Force | Out-Null
+          $skillsLink = Join-Path $linkHome 'skills'
+          New-Item -ItemType Junction -Path $skillsLink -Target $externalSkills | Out-Null
+          try {
+            Assert-Throws `
+              -Action { & $installer -CopilotHome $linkHome } `
+              -ExpectedPattern 'reparse point' `
+              -FailureMessage 'Install unexpectedly followed a managed junction.'
+            Assert-Throws `
+              -Action { & $installer -Action Verify -CopilotHome $linkHome } `
+              -ExpectedPattern 'reparse point' `
+              -FailureMessage 'Verify unexpectedly followed a managed junction.'
+          }
+          finally {
+            Remove-Item -LiteralPath $skillsLink -Force
+          }
+          if (Get-ChildItem -LiteralPath $externalSkills -Force | Select-Object -First 1) {
+            throw 'A rejected managed junction modified its target.'
+          }
+
+          $externalHome = Join-Path $env:RUNNER_TEMP 'external-home'
+          $homeLink = Join-Path $env:RUNNER_TEMP 'copilot-home-link'
+          New-Item -ItemType Directory -Path $externalHome -Force | Out-Null
+          New-Item -ItemType Junction -Path $homeLink -Target $externalHome | Out-Null
+          try {
+            Assert-Throws `
+              -Action { & $installer -CopilotHome $homeLink } `
+              -ExpectedPattern 'Copilot home path must not contain.*reparse point' `
+              -FailureMessage 'Install unexpectedly followed a Copilot home junction.'
+            Assert-Throws `
+              -Action { & $installer -Action Verify -CopilotHome $homeLink } `
+              -ExpectedPattern 'Copilot home path must not contain.*reparse point' `
+              -FailureMessage 'Verify unexpectedly followed a Copilot home junction.'
+          }
+          finally {
+            Remove-Item -LiteralPath $homeLink -Force
+          }
+          if (Get-ChildItem -LiteralPath $externalHome -Force | Select-Object -First 1) {
+            throw 'A rejected Copilot home junction modified its target.'
+          }
+
+          $externalParent = Join-Path $env:RUNNER_TEMP 'external-parent'
+          $parentLink = Join-Path $env:RUNNER_TEMP 'copilot-parent-link'
+          New-Item -ItemType Directory -Path $externalParent -Force | Out-Null
+          New-Item -ItemType Junction -Path $parentLink -Target $externalParent | Out-Null
+          $nestedHome = Join-Path $parentLink 'not-created'
+          try {
+            Assert-Throws `
+              -Action { & $installer -CopilotHome $nestedHome } `
+              -ExpectedPattern 'Copilot home path must not contain.*reparse point' `
+              -FailureMessage 'Install probed through a Copilot home ancestor junction.'
+            Assert-Throws `
+              -Action { & $installer -Action Verify -CopilotHome $nestedHome } `
+              -ExpectedPattern 'Copilot home path must not contain.*reparse point' `
+              -FailureMessage 'Verify probed through a Copilot home ancestor junction.'
+          }
+          finally {
+            Remove-Item -LiteralPath $parentLink -Force
+          }
+          if (Get-ChildItem -LiteralPath $externalParent -Force | Select-Object -First 1) {
+            throw 'A rejected Copilot home ancestor junction modified its target.'
+          }
+
+          $finalVerifyOutput = @(& $installer -Action Verify -CopilotHome $copilotHome)
+          if ($finalVerifyOutput -notcontains 'LUNA_SUBAGENTS_VERIFY_OK') {
+            throw 'Final verification did not report success.'
+          }
